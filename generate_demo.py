@@ -22,53 +22,71 @@ import numpy as np
 from mosaic import generate_panorama
 
 RNG = np.random.default_rng(7)
-SCENE_W, SCENE_H = 2400, 480
 VIEW_W, VIEW_H = 640, 400
 N_FRAMES = 80
 N_OUT = 30
+STEP = 18                  # background pan per frame (px)
+FG_PARALLAX = 1.7          # foreground pans faster -> depth parallax -> wiggle stereo
 
 
-def build_scene() -> np.ndarray:
-    """A wide textured backdrop with plenty of corners for optical flow."""
-    grad = np.linspace(40, 130, SCENE_W).astype(np.uint8)
-    scene = np.repeat(grad[None, :, None], SCENE_H, axis=0).repeat(3, axis=2).copy()
-    for _ in range(800):
-        x, y = int(RNG.integers(0, SCENE_W)), int(RNG.integers(0, SCENE_H))
-        color = tuple(int(c) for c in RNG.integers(0, 256, 3))
-        kind = RNG.integers(0, 3)
-        if kind == 0:
-            cv2.circle(scene, (x, y), int(RNG.integers(4, 22)), color, -1)
-        elif kind == 1:
-            w, h = int(RNG.integers(8, 44)), int(RNG.integers(8, 44))
-            cv2.rectangle(scene, (x, y), (x + w, y + h), color, -1)
+def _scatter(layer, mask, n, kinds, size_range, rng):
+    """Draw n random shapes onto an RGB layer + its alpha mask."""
+    h, w = layer.shape[:2]
+    for _ in range(n):
+        x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
+        color = tuple(int(c) for c in rng.integers(40, 256, 3))
+        lo, hi = size_range
+        if rng.integers(0, 2) == 0:
+            r = int(rng.integers(lo, hi))
+            cv2.circle(layer, (x, y), r, color, -1)
+            cv2.circle(mask, (x, y), r, 255, -1)
         else:
-            x2, y2 = x + int(RNG.integers(-40, 40)), y + int(RNG.integers(-40, 40))
-            cv2.line(scene, (x, y), (x2, y2), color, int(RNG.integers(1, 4)))
-    noise = RNG.integers(-8, 9, scene.shape)
-    return np.clip(scene.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+            wd, ht = int(rng.integers(lo, hi)), int(rng.integers(lo, hi))
+            cv2.rectangle(layer, (x, y), (x + wd, y + ht), color, -1)
+            cv2.rectangle(mask, (x, y), (x + wd, y + ht), 255, -1)
 
 
-def render_frames(scene: np.ndarray, out_dir: str) -> list[np.ndarray]:
-    """Sweep a viewport left-to-right; save frame_*.jpg and return RGB frames."""
-    xs = np.linspace(0, SCENE_W - VIEW_W, N_FRAMES)
-    y_centre = (SCENE_H - VIEW_H) // 2
+def build_layers(pan: int):
+    """Build a far background and a near foreground, each wide enough to pan."""
+    bg_w = VIEW_W + pan + 8
+    fg_w = VIEW_W + int(pan * FG_PARALLAX) + 8
+    # far background: sky->ground gradient + lots of small distant detail
+    col = np.linspace(210, 70, VIEW_H).astype(np.uint8)
+    bg = np.repeat(col[:, None, None], bg_w, axis=1).repeat(3, axis=2).copy()
+    bg[:, :, 2] = np.clip(bg[:, :, 2].astype(int) + 25, 0, 255)  # bluish sky tint
+    _scatter(bg, np.zeros((VIEW_H, bg_w), np.uint8), 700, None, (3, 12), RNG)
+    bg = np.clip(bg.astype(np.int16) + RNG.integers(-6, 7, bg.shape), 0, 255).astype(np.uint8)
+    # near foreground: a few big objects on a transparent layer
+    fg = np.zeros((VIEW_H, fg_w, 3), np.uint8)
+    fg_mask = np.zeros((VIEW_H, fg_w), np.uint8)
+    _scatter(fg, fg_mask, 40, None, (45, 120), RNG)
+    return bg, fg, fg_mask
+
+
+def render_frames(out_dir: str) -> list[np.ndarray]:
+    """Composite background + parallax foreground per frame; save frame_*.jpg."""
+    pan = STEP * (N_FRAMES - 1)
+    bg, fg, fg_mask = build_layers(pan)
     frames = []
-    for i, x in enumerate(xs):
-        x = int(round(x))
-        y = int(np.clip(y_centre + 25 * np.sin(2 * np.pi * i / N_FRAMES), 0, SCENE_H - VIEW_H))
-        view = scene[y:y + VIEW_H, x:x + VIEW_W]
-        cv2.imwrite(os.path.join(out_dir, f"frame_{i:05d}.jpg"), cv2.cvtColor(view, cv2.COLOR_RGB2BGR))
-        frames.append(view.copy())
+    for i in range(N_FRAMES):
+        bx = int(round(i * STEP))
+        fx = int(round(i * STEP * FG_PARALLAX))
+        frame = bg[:, bx:bx + VIEW_W].copy()
+        fg_slice = fg[:, fx:fx + VIEW_W]
+        m = fg_mask[:, fx:fx + VIEW_W].astype(bool)
+        frame[m] = fg_slice[m]
+        frame = np.clip(frame.astype(np.int16) + RNG.integers(-4, 5, frame.shape), 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(out_dir, f"frame_{i:05d}.jpg"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        frames.append(frame)
     return frames
 
 
 def main() -> None:
     out = Path(__file__).parent / "videos"
     out.mkdir(exist_ok=True)
-    scene = build_scene()
 
     with tempfile.TemporaryDirectory() as tmp:
-        input_frames = render_frames(scene, tmp)
+        input_frames = render_frames(tmp)
         mediapy.write_video(out / "demo_input.mp4", input_frames, fps=20)
         print(f"wrote {out / 'demo_input.mp4'}  ({len(input_frames)} frames)")
 
